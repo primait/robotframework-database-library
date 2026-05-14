@@ -13,6 +13,9 @@
 #  limitations under the License.
 
 import importlib
+import inspect
+import re
+import ssl
 import robot
 from robot.libraries.BuiltIn import BuiltIn
 from robot.utils.asserts import fail
@@ -24,6 +27,9 @@ except:
     import configparser as ConfigParser
 
 from robot.api import logger
+
+RDS_GLOBAL_BUNDLE_PATH = '/etc/ssl/certs/rds-global-bundle.pem'
+RDS_HOST_SUFFIX = '.rds.amazonaws.com'
 
 
 class ConnectionManager(object):
@@ -62,6 +68,94 @@ class ConnectionManager(object):
         db_api_module_name = obj_dict['module']
 
         return dbconnection, db_api_module_name
+
+    def _is_rds_hostname(self, db_host):
+        return bool(db_host) and db_host.endswith(RDS_HOST_SUFFIX)
+
+    def _get_rds_postgresql_ssl_mode(self, db_host):
+        if self._is_rds_hostname(db_host):
+            return 'verify-full'
+        # Custom aliases to RDS will not match the AWS-issued hostname,
+        # so verified TLS falls back to CA validation for those hosts.
+        return 'verify-ca'
+
+    def _get_connect_signature(self, db_api_2):
+        try:
+            return inspect.signature(db_api_2.connect)
+        except (TypeError, ValueError):
+            return None
+
+    def _get_connection_host(self, db_api_2, connection_args, connection_kwargs):
+        db_host = connection_kwargs.get('host') or connection_kwargs.get('hostname')
+        if db_host:
+            return db_host
+        dsn = connection_kwargs.get('dsn')
+        if dsn:
+            return self._get_host_from_dsn(dsn)
+        if connection_args:
+            db_host = self._get_host_from_dsn(connection_args[0])
+            if db_host:
+                return db_host
+        connect_signature = self._get_connect_signature(db_api_2)
+        if connect_signature is None:
+            return None
+        try:
+            bound_args = connect_signature.bind_partial(*connection_args, **connection_kwargs)
+        except TypeError:
+            return None
+        return bound_args.arguments.get('host') or bound_args.arguments.get('hostname')
+
+    def _get_host_from_dsn(self, dsn):
+        if not isinstance(dsn, str):
+            return None
+        if '://' in dsn:
+            data_connection = urlparse(dsn)
+            if data_connection.hostname:
+                return data_connection.hostname
+        match = re.search(r'(?:^|\s)(?:host|hostname)\s*=\s*([^\s]+)', dsn)
+        if match:
+            return match.group(1)
+        return None
+
+    def _get_mysql_tls_config(self, dbapiModuleName, db_api_2, dbHost):
+        verify_identity = self._is_rds_hostname(dbHost)
+        if dbapiModuleName == "pymysql":
+            # PyMySQL can enforce CA validation and hostname checks together
+            # when the connection uses the canonical RDS endpoint name.
+            tls_config = {
+                'ssl': {
+                    'ca': RDS_GLOBAL_BUNDLE_PATH,
+                    'cert_reqs': ssl.CERT_REQUIRED,
+                }
+            }
+            connect_signature = self._get_connect_signature(db_api_2)
+            if connect_signature is not None:
+                if 'ssl_disabled' in connect_signature.parameters:
+                    tls_config['ssl_disabled'] = False
+                if 'ssl_verify_cert' in connect_signature.parameters:
+                    tls_config['ssl_verify_cert'] = True
+                if 'ssl_verify_identity' in connect_signature.parameters:
+                    tls_config['ssl_verify_identity'] = verify_identity
+                else:
+                    # Older PyMySQL versions do not expose hostname checks here,
+                    # so verified TLS falls back to CA validation for those drivers.
+                    pass
+            return tls_config
+        # MySQLdb does not expose hostname verification through this API, so
+        # the verified TLS fallback is CA validation against the RDS bundle.
+        return {'ssl': {'ca': RDS_GLOBAL_BUNDLE_PATH}}
+
+    def _apply_tls_settings(self, dbapiModuleName, db_api_2, connection_args, connection_kwargs):
+        dbHost = self._get_connection_host(db_api_2, connection_args, connection_kwargs)
+        if dbapiModuleName == "psycopg2":
+            # Force verified TLS for PostgreSQL with the AWS RDS CA bundle.
+            connection_kwargs['sslmode'] = self._get_rds_postgresql_ssl_mode(dbHost)
+            connection_kwargs['sslrootcert'] = RDS_GLOBAL_BUNDLE_PATH
+        elif dbapiModuleName in ["MySQLdb", "pymysql"]:
+            # Force verified TLS for MySQL-family drivers with the AWS RDS CA bundle.
+            connection_kwargs.update(
+                self._get_mysql_tls_config(dbapiModuleName, db_api_2, dbHost))
+        return connection_kwargs
 
     def connect_to_database(self, dbapiModuleName=None, dbName=None, dbUsername=None, dbPassword=None, dbHost=None,
                             dbPort=None, dbCharset=None, dbConfigFile="./resources/db.cfg", url=None, alias=None):
@@ -158,16 +252,34 @@ class ConnectionManager(object):
 
             if dbapiModuleName in ["MySQLdb", "pymysql"]:
                 dbPort = dbPort or 3306
-                logger.info('Connecting using : %s.connect(db=%s, user=%s, passwd=%s, host=%s, port=%s, charset=%s) ' %
+                mysql_connection_args = {
+                    'db': dbName,
+                    'user': dbUsername,
+                    'passwd': dbPassword,
+                    'host': dbHost,
+                    'port': dbPort,
+                    'charset': dbCharset,
+                }
+                # Always require verified TLS when creating MySQL connections.
+                mysql_connection_args.update(
+                    self._get_mysql_tls_config(dbapiModuleName, db_api_2, dbHost))
+                logger.info('Connecting using : %s.connect(db=%s, user=%s, passwd=%s, host=%s, port=%s, charset=%s, ssl=verified) ' %
                             (dbapiModuleName, dbName, dbUsername, dbPassword, dbHost, dbPort, dbCharset))
-                dbconnection = db_api_2.connect(
-                    db=dbName, user=dbUsername, passwd=dbPassword, host=dbHost, port=dbPort, charset=dbCharset)
+                dbconnection = db_api_2.connect(**mysql_connection_args)
             elif dbapiModuleName in ["psycopg2"]:
                 dbPort = dbPort or 5432
-                logger.info('Connecting using : %s.connect(database=%s, user=%s, password=%s, host=%s, port=%s) ' %
-                            (dbapiModuleName, dbName, dbUsername, dbPassword, dbHost, dbPort))
+                postgresql_ssl_mode = self._get_rds_postgresql_ssl_mode(dbHost)
+                logger.info('Connecting using : %s.connect(database=%s, user=%s, password=%s, host=%s, port=%s, sslmode=%s, sslrootcert=%s) ' %
+                            (dbapiModuleName, dbName, dbUsername, dbPassword, dbHost, dbPort,
+                             postgresql_ssl_mode, RDS_GLOBAL_BUNDLE_PATH))
                 dbconnection = db_api_2.connect(
-                    database=dbName, user=dbUsername, password=dbPassword, host=dbHost, port=dbPort)
+                    database=dbName,
+                    user=dbUsername,
+                    password=dbPassword,
+                    host=dbHost,
+                    port=dbPort,
+                    sslmode=postgresql_ssl_mode,
+                    sslrootcert=RDS_GLOBAL_BUNDLE_PATH)
             elif dbapiModuleName in ["pyodbc", "pypyodbc"]:
                 dbPort = dbPort or 1433
                 logger.info('Connecting using : %s.connect(DRIVER={SQL Server};SERVER=%s,%s;DATABASE=%s;UID=%s;PWD=%s)' %
@@ -219,9 +331,12 @@ class ConnectionManager(object):
         logger.info('Creating Db Connection using : alias=%s, dbapiModuleName=%s, db_connect_string=%s' %
                     (alias, dbapiModuleName, db_connect_string))
 
-        return self._connect_to_database_using_custom_params(alias, dbapiModuleName, db_connect_string)
+        return self._connect_to_database_using_custom_params(
+            alias=alias,
+            dbapiModuleName=dbapiModuleName,
+            db_connect_string=db_connect_string)
 
-    def _connect_to_database_using_custom_params(self, dbapiModuleName=None, db_connect_string='', alias=None):
+    def _connect_to_database_using_custom_params(self, alias=None, dbapiModuleName=None, db_connect_string=''):
         """
         Loads the DB API 2.0 module given `dbapiModuleName` then uses it to
         connect to the database using the map string `db_custom_param_string`.
@@ -238,11 +353,16 @@ class ConnectionManager(object):
 
         db_api_2 = importlib.import_module(dbapiModuleName)
 
-        db_connect_string = 'db_api_2.connect(%s)' % db_connect_string
+        def secure_connect(*connection_args, **connection_kwargs):
+            connection_kwargs = self._apply_tls_settings(
+                dbapiModuleName, db_api_2, connection_args, connection_kwargs)
+            return db_api_2.connect(*connection_args, **connection_kwargs)
+
+        db_connect_string = 'secure_connect(%s)' % db_connect_string
 
         logger.info('Executing : Connect To Database Using Custom Params : %s.connect(%s) ' % (
             dbapiModuleName, db_connect_string))
-        dbconnection = eval(db_connect_string)
+        dbconnection = eval(db_connect_string, {'db_api_2': db_api_2, 'secure_connect': secure_connect})
 
         self._push_cache(alias, dbconnection, dbapiModuleName)
 
