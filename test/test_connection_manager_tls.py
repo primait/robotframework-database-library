@@ -174,6 +174,54 @@ class ConnectionManagerTlsTests(unittest.TestCase):
         self.assertTrue(fake_module.calls[0]['ssl_verify_cert'])
         self.assertTrue(fake_module.calls[0]['ssl_verify_identity'])
 
+    def test_pymysql_accepts_explicit_tls_keyword_arguments(self):
+        fake_module = _FakePyMySQLModule()
+
+        with mock.patch.object(self.module.importlib, 'import_module', return_value=fake_module):
+            self.manager._connect_to_database(
+                alias='mysql',
+                dbapiModuleName='pymysql',
+                dbName='app',
+                dbUsername='user',
+                dbPassword='secret',
+                dbHost='mysql-staging.internal',
+                dbPort=3306,
+                dbCharset='utf8mb4',
+                ssl_ca='/tmp/custom-ca.pem',
+                ssl_verify_cert=True,
+                ssl_verify_identity=False)
+
+        self.assertEqual(len(fake_module.calls), 1)
+        self.assertEqual(
+            fake_module.calls[0]['ssl']['ca'],
+            '/tmp/custom-ca.pem')
+        self.assertEqual(
+            fake_module.calls[0]['ssl']['cert_reqs'],
+            self.module.ssl.CERT_REQUIRED)
+        self.assertFalse(fake_module.calls[0]['ssl_disabled'])
+        self.assertTrue(fake_module.calls[0]['ssl_verify_cert'])
+        self.assertFalse(fake_module.calls[0]['ssl_verify_identity'])
+
+    def test_psycopg2_accepts_explicit_tls_keyword_arguments(self):
+        fake_module = _FakePsycopg2Module()
+
+        with mock.patch.object(self.module.importlib, 'import_module', return_value=fake_module):
+            self.manager._connect_to_database(
+                alias='pg',
+                dbapiModuleName='psycopg2',
+                dbName='app',
+                dbUsername='user',
+                dbPassword='secret',
+                dbHost='pgsql-staging.internal',
+                dbPort=5432,
+                dbCharset=None,
+                sslmode='verify-full',
+                sslrootcert='/tmp/custom-ca.pem')
+
+        self.assertEqual(len(fake_module.calls), 1)
+        self.assertEqual(fake_module.calls[0]['sslmode'], 'verify-full')
+        self.assertEqual(fake_module.calls[0]['sslrootcert'], '/tmp/custom-ca.pem')
+
     def test_custom_params_override_insecure_postgresql_tls_flags(self):
         fake_module = _FakePsycopg2Module()
 
