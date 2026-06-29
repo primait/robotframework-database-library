@@ -1,0 +1,10 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: "robotframework-database-library"
+  description: "Database Library contains utilities meant for Robot Framework's usage"
+spec:
+  type: "library"
+  lifecycle: production
+  owner: "group:default/team-claims-settlement"
+  system: prima.it
