@@ -1,0 +1,11 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: robotframework-database-library
+  description: Robot Framework library with database utilities, compatible with any Python Database API 2.0 module.
+  annotations:
+    github.com/project-slug: primait/robotframework-database-library
+spec:
+  type: library
+  lifecycle: production
+  owner: team-claims-settlement
